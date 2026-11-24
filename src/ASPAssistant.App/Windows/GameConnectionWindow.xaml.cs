@@ -20,6 +20,7 @@ namespace ASPAssistant.App.Windows;
 /// </summary>
 public partial class GameConnectionWindow : Window
 {
+    private static readonly TimeSpan ConnectionTestTimeout = TimeSpan.FromSeconds(60);
     private enum Tone { Neutral, Busy, Ok, Error }
 
     private readonly ScreenCaptureService _capture;
@@ -27,6 +28,7 @@ public partial class GameConnectionWindow : Window
     private bool _busy;
     private bool _loading = true;
     private bool _manualEdited;
+    private bool _isDialogClosed;
     /// <summary>An ADB connection that passed the test for the current fields.</summary>
     private GameConnectionService? _tested;
 
@@ -63,7 +65,15 @@ public partial class GameConnectionWindow : Window
         UpdateMode();
         if (capture.Connection.IsAdb) SetStatus(Tone.Neutral, "当前连接", capture.Connection.Status);
         Closing += (_, e) => e.Cancel = _busy;
-        Closed += (_, _) => { if (DialogResult != true) _tested?.Dispose(); };
+        Closed += (_, _) =>
+        {
+            _isDialogClosed = true;
+            if (DialogResult != true && _tested is { } tested)
+            {
+                _tested = null;
+                ConnectionTestCoordinator.Shared.DisposeRetired(tested);
+            }
+        };
     }
 
     private bool IsAdb => AdbMode.IsChecked == true;
@@ -89,6 +99,7 @@ public partial class GameConnectionWindow : Window
     private void OnSourceChanged(object sender, RoutedEventArgs e)
     {
         if (_loading) return;
+        InvalidateTest();
         UpdateMode();
     }
 
@@ -143,7 +154,7 @@ public partial class GameConnectionWindow : Window
     private void InvalidateTest()
     {
         if (_loading || _busy || _tested is null) return;
-        _tested.Dispose();
+        ConnectionTestCoordinator.Shared.DisposeRetired(_tested);
         _tested = null;
         UpdateMode();
     }
@@ -325,30 +336,59 @@ public partial class GameConnectionWindow : Window
                 return;
             }
         }
-        var candidate = NewCandidate(true, window);
+        var settings = NewSettings(true, window);
+        var windowHandle = window.Handle;
+        var maxWidth = _capture.MaxCaptureWidth;
         SetBusy(true);
-        SetStatus(Tone.Busy, "正在连接并读取画面", "首次连接需要几秒");
+        SetStatus(Tone.Busy, "正在连接并读取画面", $"连接测试最多等待 {ConnectionTestTimeout.TotalSeconds:0} 秒");
         try
         {
-            var png = await Task.Run(() => candidate.CaptureAdbScreen(_capture.MaxCaptureWidth, waitForInitialDisplay: true));
-            if (png is null) throw new IOException(candidate.Status);
-            if (candidate.FindGameWindow() == IntPtr.Zero || candidate.GetViewport(window.Handle) is null)
-                throw new IOException("游戏显示区域不可用，请恢复对应模拟器窗口后重试。");
-            var (preview, width, height) = Decode(png);
-            _tested = candidate;
-            SetStatus(Tone.Ok, "已读到画面",
-                preview is null ? candidate.Status : $"{candidate.CurrentDisplay?.Label} · {width}×{height} · 点「应用」开始使用", preview);
-            ApplyButton.Content = "应用";
+            var result = await ConnectionTestCoordinator.Shared.RunAsync(
+                () => new GameConnectionService(settings, windowHandle),
+                candidate =>
+                {
+                    var png = candidate.CaptureAdbScreen(maxWidth, waitForInitialDisplay: true);
+                    if (png is null) throw new IOException(candidate.Status);
+                    if (candidate.FindGameWindow() == IntPtr.Zero || candidate.GetViewport(windowHandle) is null)
+                        throw new IOException("游戏显示区域不可用，请恢复对应模拟器窗口后重试。");
+                    return png;
+                }, ConnectionTestTimeout);
+            using var success = result.Success;
+            // Application shutdown can close the dialog while the test is still running.
+            if (_isDialogClosed) return;
+
+            switch (result.Status)
+            {
+                case ConnectionTestStatus.Succeeded:
+                    var (preview, width, height) = Decode(success!.Value);
+                    var candidate = success.Adopt();
+                    _tested = candidate;
+                    SetStatus(Tone.Ok, "已读到画面",
+                        preview is null ? candidate.Status : $"{candidate.CurrentDisplay?.Label} · {width}×{height} · 点「应用」开始使用", preview);
+                    ApplyButton.Content = "应用";
+                    break;
+                case ConnectionTestStatus.TimedOut:
+                    SetStatus(Tone.Error, "连接测试超时", $"已等待 {ConnectionTestTimeout.TotalSeconds:0} 秒，底层连接或截图可能仍在等待，暂时无法再次测试。请稍候；如长时间没有结束，可尝试重启助手或模拟器。");
+                    break;
+                case ConnectionTestStatus.Busy:
+                    SetStatus(Tone.Error, "上一次连接测试尚未结束", "上一次测试的底层操作或清理仍在进行，暂时无法再次测试。请稍候；如长时间没有结束，可尝试重启助手或模拟器。");
+                    break;
+                case ConnectionTestStatus.Failed:
+                    SetStatus(Tone.Error, "读不到画面", $"{result.Error?.Message} 确认实例已启动、地址正确，再点「发现设备」。");
+                    break;
+            }
         }
         catch (Exception ex)
         {
-            candidate.Dispose();
-            SetStatus(Tone.Error, "读不到画面", $"{ex.Message} 确认实例已启动、地址正确，再点「发现设备」。");
+            if (!_isDialogClosed) SetStatus(Tone.Error, "读不到画面", $"{ex.Message} 确认实例已启动、地址正确，再点「发现设备」。");
         }
         finally
         {
-            SetBusy(false);
-            ConnectionBody.ScrollToBottom();
+            if (!_isDialogClosed)
+            {
+                SetBusy(false);
+                ConnectionBody.ScrollToBottom();
+            }
         }
     }
 
